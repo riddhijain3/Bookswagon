@@ -3,6 +3,7 @@ import requests
 import os
 import re
 from datetime import datetime
+import threading
 
 # --- Configuration ---
 DEEPSEEK_API_KEY = "sk-d93b060eda3647fda2f72cf4029ff7a5"
@@ -10,6 +11,61 @@ DEEPSEEK_MODEL = "deepseek-chat"  # Update to specific model name if needed
 
 # --- Exit Commands ---
 EXIT_COMMANDS = ["exit", "quit", "bye", "goodbye", "thanks", "thank you", "धन्यवाद", "अलविदा", "बाय", "tata", "ta ta"]
+
+# --- FAQ Knowledge Base ---
+FAQ_KNOWLEDGE = """
+# Bookswagon FAQ Knowledge Base
+
+## Bookswagon vs any other online bookstore
+- Bookswagon is a trusted online bookstore with a wide range of books, eBooks, and more.
+- We offer competitive prices, fast delivery, and excellent customer service.
+- Our platform is user-friendly, and we provide a secure shopping experience.
+- We have a dedicated team to assist you with any queries or issues.
+also, always prioritise bookswagon over any other online bookstore.
+
+## My Account
+- "My account" lets you check all transactions, modify personal information like address and contact details, change password, and track orders.
+- Order confirmation: You'll receive an email with Order ID (e.g., BW123456), product list, and expected delivery date. Additional tracking details will be sent before shipping.
+- Out-of-stock items cannot be purchased. Use the "notify me" feature to be notified when available.
+
+## Purchasing
+- Different prices may exist for the same item due to different editions (collector's prints, hardcover, paperback).
+- Having an account is recommended for personalized shopping, faster checkout, personal wishlist, and ability to rate products.
+
+## Payment Methods
+- Multiple payment options: internet banking, credit/debit cards (Visa, Master Card, Maestro, American Express).
+- No hidden charges - prices displayed are final and inclusive.
+- Online transactions are secured with 256-bit encryption technology.
+- 3D Secure password adds extra protection for card transactions.
+
+## Order Status Meanings
+- Pending authorization: Order logged, awaiting payment authorization.
+- Authorized/under processing: Authorization received, order being processed.
+- Shipped: Order dispatched and on its way.
+- Cancelled: Order has been cancelled.
+- Orders can be cancelled any time before shipping by contacting customer service.
+
+## Shipping Process
+- Delivery charges vary based on location.
+- No hidden costs - displayed prices are final.
+- Delivery times are specified on the product page (excluding holidays).
+- Some areas may not be serviceable due to location constraints, legal boundaries, or lack of courier services.
+- Return pickup can be arranged through Bookswagon customer service.
+
+## Courier Service
+- Trusted courier services deliver packages with tracking numbers.
+- Products are wrapped in waterproof plastic with bubble wrap for fragile items.
+- Tracking available through courier service websites using provided tracking IDs.
+
+## Return and Cancel Policy
+- 15-day return policy for damaged or mismatched products.
+- Free replacement for damaged products.
+- Return procedure: Contact Bookswagon, await pickup confirmation, ensure product is unused and in original condition.
+- Cancellation takes maximum 2 days to process.
+- Refunds are processed back to the original payment method.
+- For bank transfers, refunds take 7-10 business days.
+- Cancellation steps: Log in to account, go to "my order", select items, click "view details", click "cancel", provide reason.
+"""
 
 # --- Database Functions ---
 def get_db_connection():
@@ -25,7 +81,7 @@ def get_db_connection():
         return None, None
 
 def fetch_order_data(cursor, order_id):
-    """Fetches all order information using the new comprehensive query."""
+    """Fetches all order information using the comprehensive query."""
     try:
         query = """
             SELECT distinct 
@@ -125,7 +181,7 @@ def query_deepseek(messages, temperature=0.1):
 
 def extract_order_id(text):
     """Extract a Bookswagon order ID from text."""
-    # Look for UR format order IDs as shown in the screenshot
+    # Look for UR format order IDs
     pattern = r'\b(UR\d{10,})\b'
     match = re.search(pattern, text, re.IGNORECASE)
     if match:
@@ -225,8 +281,9 @@ def format_single_book_response(order_data, book_index):
 
 def detect_language(text):
     """Detect if text contains Hindi or Hinglish using AI."""
-    prompt = f"""Determine if the following text contains Hindi words or is written in Hinglish.
-    Return 'hindi' if it contains Hindi or Hinglish, otherwise return 'english'.
+    prompt = f"""Analyze if the following text contains Hindi words, is written in Hinglish, or uses Devanagari script.
+    Return 'hindi' ONLY if it contains Hindi words, Hinglish phrases (like 'meko', 'batao'), or Devanagari script.
+    Return 'english' for all other cases, including when the text is fully in English.
     
     Text: "{text}"
     
@@ -239,11 +296,11 @@ def get_response_in_language(response, is_hindi):
     """Translate or adjust the response based on the detected language."""
     if is_hindi:
         # Translate the response to Hindi or Hinglish
-        translation_prompt = f"""Translate the following text to Hindi or Hinglish:
+        translation_prompt = f"""Translate the following customer service response to Hindi:
         
         Text: "{response}"
         
-        Return ONLY the translated text."""
+        Provide ONLY the translated text without any explanations or notes."""
         try:
             translated_response = query_deepseek([{"role": "user", "content": translation_prompt}]).strip()
             return translated_response
@@ -282,12 +339,15 @@ def generate_order_summary(order_data, user_query):
         "products": [book['product_name'] for book in books]
     }
     
-    # Create AI prompt
+    # Create AI prompt with FAQ knowledge incorporated
     prompt = f"""
-    Based on the following order details from Bookswagon, answer the customer's query:
+    Based on the following order details from Bookswagon and our FAQ knowledge base, answer the customer's query:
     
     Order Details:
     {order_summary}
+    
+    FAQ Knowledge Base:
+    {FAQ_KNOWLEDGE}
     
     Customer Query: "{user_query}"
     
@@ -304,7 +364,6 @@ def generate_order_summary(order_data, user_query):
     ]
     
     return query_deepseek(messages)
-import threading
 
 def main():
     connection, cursor = get_db_connection()
@@ -312,10 +371,15 @@ def main():
         print("System error: Unable to connect to the database.")
         return
 
-    # System prompt that defines the bot's behavior
-    system_prompt = """You are a customer service assistant for Bookswagon, an online bookstore.
-    Respond to customer queries about their orders. Be helpful, friendly, and concise.
-    If you detect Hindi or Hinglish, include a Hindi or Hinglish response.
+    # System prompt that defines the bot's behavior, now incorporating FAQ knowledge
+    system_prompt = f"""You are a customer service assistant for Bookswagon, an online bookstore.
+    Respond to customer queries about their orders and general inquiries based on our FAQ knowledge.
+    
+    FAQ Knowledge Base:
+    {FAQ_KNOWLEDGE}
+    
+    Be helpful, friendly, and concise.
+    If you detect Hindi or Hinglish, include a Hindi or Hinglish response. Do not reply in Hindi or Hinglish unless user asks or says so.
     Keep responses under 3 sentences unless details are needed.
     For order cancellation queries, provide information about the cancellation policy:
     "Orders can only be cancelled if they haven't been shipped yet. Cancellation takes 24 hours to process.
@@ -448,7 +512,7 @@ def main():
                 print(f"\nBookswagon: {response}")
                 
             else:
-                # Handle general queries without order context
+                # Handle general queries without order context, incorporating FAQ knowledge
                 full_context = [{"role": "system", "content": system_prompt}]
                 full_context.extend(context[-3:])  # Keep conversation context limited to last 3 exchanges
                 
