@@ -285,14 +285,16 @@ def detect_language(text):
         prompt = f"""Analyze if the following text contains Hindi words, is written in Hinglish, or uses Devanagari script.
         Return 'hindi' ONLY if it contains Hindi words, Hinglish phrases (like 'meko', 'batao'), or Devanagari script.
         Return 'english' for all other cases, including when the text is fully in English.
+        
         Text: "{text}"
+        
         Return ONLY 'hindi' or 'english', nothing else."""
+        
         result = query_deepseek([{"role": "user", "content": prompt}]).strip().lower()
-        \
-        # Ensure the result is valid
         if result not in ["hindi", "english"]:
             print(f"Warning: Unexpected language detection result: {result}. Defaulting to 'english'.")
             return False  # Default to English
+        
         return result == "hindi"
     except Exception as e:
         print(f"Error detecting language: {e}. Defaulting to 'english'.")
@@ -303,16 +305,18 @@ def get_response_in_language(response, is_hindi):
     if is_hindi:
         # Translate the response to Hindi or Hinglish
         translation_prompt = f"""Translate the following customer service response to Hindi:
+        
         Text: "{response}"
+        
         Provide ONLY the translated text without any explanations or notes."""
         try:
             translated_response = query_deepseek([{"role": "user", "content": translation_prompt}]).strip()
+            print(f"Debug: Translated response: {translated_response}")
             return translated_response
         except Exception as e:
             print(f"Error translating response: {e}")
             return response  # Fallback to English response
-        
-    else: return response  # Return the original English response if not Hindi
+    return response  # Return the original English response if not Hindi
 
 def generate_order_summary(order_data, user_query):
     """Generate a natural language response about the order using AI."""
@@ -408,7 +412,11 @@ def main():
         if not timeout_flag.wait(300):  # Wait for 300 seconds
             farewell_message = "I didn't receive any response. Have a great day! Thank you for using Bookswagon support."
             print(f"\nBookswagon: {farewell_message}")
-            exit(0)
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+            os._exit(0)
 
     try:
         while True:
