@@ -92,6 +92,7 @@ def fetch_order_data(cursor, order_id):
                 v1.showOrderDate,
                 v1.DueDate,
                 v1.OrderStatus,
+                oc.reason,
                 v1.PaymentStatus,
                 v1.amount,
                 v1.customer_Email,
@@ -105,6 +106,7 @@ def fetch_order_data(cursor, order_id):
                 sa.Tracking_Number
             FROM View_GetOrderDetailListUpdatedNew v1
             JOIN Table_OrderSummary os ON v1.Order_Number = os.Order_Number
+            full Join Table_OrderCancellationReason oc on os.ID_CancellationReason = oc.ID_OrderCancellationReason
             JOIN Table_OrderShippingAddress sa ON os.ID_OrderSummary = sa.ID_OrderSummary
             OUTER APPLY (
                 SELECT distinct Product_Title, ISBN13
@@ -126,17 +128,18 @@ def fetch_order_data(cursor, order_id):
             'purchase_date': results[0][4],
             'promise_date': results[0][5],
             'order_status': results[0][6],
-            'payment_status': results[0][7],
-            'order_amount': results[0][8],
-            'customer_email': results[0][9],
-            'customer_name': results[0][10],
-            'shipping_address': results[0][11],
-            'shipping_city': results[0][12],
-            'shipping_country': results[0][13],
-            'shipping_state': results[0][14],
-            'shipping_zip': results[0][15],
-            'shipping_mobile': results[0][16],
-            'tracking_number': results[0][17]
+            'cancellation_reason': results[0][7],  # Store cancellation reason
+            'payment_status': results[0][8],
+            'order_amount': results[0][9],
+            'customer_email': results[0][10],
+            'customer_name': results[0][11],
+            'shipping_address': results[0][12],
+            'shipping_city': results[0][13],
+            'shipping_country': results[0][14],
+            'shipping_state': results[0][15],
+            'shipping_zip': results[0][16],
+            'shipping_mobile': results[0][17],
+            'tracking_number': results[0][18]
         }
         
         # Extract books/products
@@ -146,7 +149,7 @@ def fetch_order_data(cursor, order_id):
                 books.append({
                     'product_name': row[2],
                     'isbn': row[3],
-                    'tracking_number': row[17]
+                    'tracking_number': row[18]
                 })
         
         return {
@@ -232,6 +235,10 @@ def format_order_response(order_data):
         f"Tracking Number: {order_details.get('tracking_number') or 'Not available'}\n"
     )
     
+    # Add cancellation reason if order is cancelled
+    if order_details.get('order_status', '').lower() == 'cancelled' and order_details.get('cancellation_reason'):
+        formatted_response += f"Cancellation Reason: {order_details.get('cancellation_reason')}\n"
+    
     # Add shipping details
     formatted_response += (
         f"\nShipping Address:\n"
@@ -277,14 +284,24 @@ def format_single_book_response(order_data, book_index):
         f"Tracking Number: {book['tracking_number'] or 'Not available'}\n"
     )
     
+    # Add cancellation reason if order is cancelled
+    if order_details.get('order_status', '').lower() == 'cancelled' and order_details.get('cancellation_reason'):
+        formatted_response += f"Cancellation Reason: {order_details.get('cancellation_reason')}\n"
+    
     return formatted_response
 
 def detect_language(text):
     """Detect if text contains Hindi or Hinglish using AI."""
     try:
         prompt = f"""Analyze if the following text contains Hindi words, is written in Hinglish, or uses Devanagari script.
-        Return 'hindi' ONLY if it contains Hindi words, Hinglish phrases (like 'meko', 'batao'), or Devanagari script.
+        Return 'hindi' ONLY if it contains Hindi words, Hinglish phrases (like 'meko', 'batao', 'kyu', 'kya', 'mera'), or Devanagari script.
         Return 'english' for all other cases, including when the text is fully in English.
+        
+        Example texts that should be classified as 'hindi':
+        - "mera order cancel kyu hua"
+        - "मेरा ऑर्डर कैंसल क्यों हुआ"
+        - "order kab milega"
+        - "kitne din me aayega mera order"
         
         Text: "{text}"
         
@@ -304,7 +321,7 @@ def get_response_in_language(response, is_hindi):
     """Translate or adjust the response based on the detected language."""
     if is_hindi:
         # Translate the response to Hindi or Hinglish
-        translation_prompt = f"""Translate the following customer service response to Hindi:
+        translation_prompt = f"""Translate the following customer service response to Hindi or Hinglish (mix of Hindi and English):
         
         Text: "{response}"
         
@@ -318,7 +335,7 @@ def get_response_in_language(response, is_hindi):
             return response  # Fallback to English response
     return response  # Return the original English response if not Hindi
 
-def generate_order_summary(order_data, user_query):
+def generate_order_summary(order_data, user_query, is_hindi):
     """Generate a natural language response about the order using AI."""
     if not order_data:
         return "Order details not found."
@@ -336,6 +353,13 @@ def generate_order_summary(order_data, user_query):
     if isinstance(promise_date, datetime):
         promise_date = promise_date.strftime("%d/%m/%Y")
     
+    # Check if the query is about cancellation
+    is_cancellation_query = False
+    cancel_keywords = ["cancel", "cancelled", "cancellation", "why cancel", "cancel kyu", "cancel kyun", "cancel kyon", "रद्द"]
+    
+    if any(keyword in user_query.lower() for keyword in cancel_keywords):
+        is_cancellation_query = True
+    
     # Prepare order summary for AI
     order_summary = {
         "order_number": order_details.get('order_number'),
@@ -348,6 +372,21 @@ def generate_order_summary(order_data, user_query):
         "products": [book['product_name'] for book in books]
     }
     
+    # Include cancellation reason if order is cancelled and query is about cancellation
+    cancellation_info = ""
+    if order_details.get('order_status', '').lower() == 'cancelled':
+        if order_details.get('cancellation_reason'):
+            cancellation_info = f"Cancellation Reason: {order_details.get('cancellation_reason')}"
+        else:
+            cancellation_info = "This order was cancelled, but no specific reason was recorded in our system."
+    
+    # Create language instruction based on detected language
+    language_instruction = ""
+    if is_hindi:
+        language_instruction = "Respond in Hindi or Hinglish (mix of Hindi and English)."
+    else:
+        language_instruction = "Respond in English only."
+    
     # Create AI prompt with FAQ knowledge incorporated
     prompt = f"""
     Based on the following order details from Bookswagon and our FAQ knowledge base, answer the customer's query:
@@ -355,14 +394,20 @@ def generate_order_summary(order_data, user_query):
     Order Details:
     {order_summary}
     
+    {cancellation_info}
+    
     FAQ Knowledge Base:
     {FAQ_KNOWLEDGE}
     
     Customer Query: "{user_query}"
     
+    {language_instruction}
+    
     Provide a helpful, concise response addressing the customer's specific question.
     Keep your response under 3 sentences unless detailed information is absolutely necessary.
-    For cancellation queries, mention the standard policy: "Orders can only be cancelled if they haven't been shipped yet. 
+    
+    If the query is about order cancellation and the order is cancelled, clearly explain the reason for cancellation.
+    For general cancellation queries, mention the standard policy: "Orders can only be cancelled if they haven't been shipped yet. 
     Cancellation takes 24 hours to process. Please visit your account on Bookswagon.com for assistance."
     """
     
@@ -388,10 +433,13 @@ def main():
     {FAQ_KNOWLEDGE}
     
     Be helpful, friendly, and concise.
-    If you detect Hindi or Hinglish, include a Hindi or Hinglish response. Do not reply in Hindi or Hinglish unless user asks or says so.
+    IMPORTANT: Only respond in Hindi or Hinglish if the user's message contains Hindi words or is in Hinglish.
+    Otherwise, always respond in English only.
+    
     Keep responses under 3 sentences unless details are needed.
     For order cancellation queries, provide information about the cancellation policy:
     "Orders can only be cancelled if they haven't been shipped yet. Cancellation takes 24 hours to process.
+    if customer asking why their order gets cancelled, ask for their order number and provide the reason from the database.
     Please visit your account on Bookswagon.com or contact customer service for assistance with cancellation."
     Never attempt to cancel orders yourself."""
 
@@ -432,11 +480,13 @@ def main():
 
             # Detect language
             is_hindi = detect_language(user_input)
+            #print(f"Debug: Detected language is {'Hindi/Hinglish' if is_hindi else 'English'}")
 
             # Check for exit commands
             if any(cmd in user_input.lower() for cmd in EXIT_COMMANDS):
                 farewell_message = "Thank you for using Bookswagon support. Have a good day!"
-                farewell_message = get_response_in_language(farewell_message, is_hindi)
+                if is_hindi:
+                    farewell_message = get_response_in_language(farewell_message, is_hindi)
                 print(f"\nBookswagon: {farewell_message}")
                 break
 
@@ -452,45 +502,84 @@ def main():
                 
                 if not active_order_data:
                     response = f"I couldn't find any order with ID {active_order_id}. Please check the order number and try again."
-                    response = get_response_in_language(response, is_hindi)
+                    if is_hindi:
+                        response = get_response_in_language(response, is_hindi)
                     print(f"\nBookswagon: {response}")
                     active_order_id = None
                     continue
                 
                 books = active_order_data['books']
                 
+                # Check if order is cancelled and if user is asking about cancellation
+                order_details = active_order_data['order_details']
+                if order_details.get('order_status', '').lower() == 'cancelled' and any(kw in user_input.lower() for kw in ["cancel", "cancelled", "cancellation", "why", "kyu", "kyun"]):
+                    # Respond directly about cancellation
+                    if order_details.get('cancellation_reason'):
+                        response = f"Your order {active_order_id} was cancelled due to: {order_details.get('cancellation_reason')}"
+                    else:
+                        response = f"Your order {active_order_id} was cancelled, but no specific reason was recorded in our system."
+                    
+                    if is_hindi:
+                        response = get_response_in_language(response, is_hindi)
+                    print(f"\nBookswagon: {response}")
+                    continue
+                
                 if len(books) == 1:
                     # Single book order - display details directly
                     response = format_single_book_response(active_order_data, 0)
-                    response = get_response_in_language(response, is_hindi)
+                    if is_hindi:
+                        response = get_response_in_language(response, is_hindi)
                     print(f"\nBookswagon: {response}")
                     
                     # Ask follow-up
                     follow_up = "Is there anything else you'd like to know about this order?"
-                    follow_up = get_response_in_language(follow_up, is_hindi)
+                    if is_hindi:
+                        follow_up = get_response_in_language(follow_up, is_hindi)
                     print(f"\nBookswagon: {follow_up}")
                     
                 elif len(books) > 1:
                     # Format full order response with all books
                     response = format_order_response(active_order_data)
-                    response = get_response_in_language(response, is_hindi)
+                    if is_hindi:
+                        response = get_response_in_language(response, is_hindi)
                     print(f"\nBookswagon: {response}")
                     
                     # Ask which book they want details for
                     follow_up = "Which specific book would you like more details about? Please respond with the book number or name."
-                    follow_up = get_response_in_language(follow_up, is_hindi)
+                    if is_hindi:
+                        follow_up = get_response_in_language(follow_up, is_hindi)
                     print(f"\nBookswagon: {follow_up}")
                     
                 else:
                     # No books found in order (unusual case)
                     response = f"Your order {active_order_id} was found but doesn't have any products listed. This is unusual. Please contact customer support for assistance."
-                    response = get_response_in_language(response, is_hindi)
+                    if is_hindi:
+                        response = get_response_in_language(response, is_hindi)
                     print(f"\nBookswagon: {response}")
             
             elif active_order_data and active_order_id:
                 # User has an active order context
                 books = active_order_data['books']
                 
+                # Check if the user is asking about cancellation
+                if any(kw in user_input.lower() for kw in ["cancel", "cancelled", "cancellation", "why", "kyu", "kyun"]):
+                    if active_order_id:
+        # Fetch the cancellation reason from the database
+                        order_details = active_order_data['order_details']
+                        if order_details.get('order_status', '').lower() == 'cancelled':
+                            if order_details.get('cancellation_reason'):
+                                response = f"Your order {active_order_id} was cancelled due to: {order_details.get('cancellation_reason')}."
+                            else:
+                                response = f"Your order {active_order_id} was cancelled, but no specific reason was recorded in our system."
+                        else:
+                            response = f"Your order {active_order_id} is not cancelled. Its current status is: {order_details.get('order_status')}."
+                    else:
+        # Ask the user for the order number
+                        response = "Could you please provide your order number so I can check the cancellation reason for you?"
+                    if is_hindi:
+                        response = get_response_in_language(response, is_hindi)
+                    print(f"\nBookswagon: {response}")
+                    continue
                 if len(books) > 1:
                     # Check if user is selecting a specific book
                     try:
@@ -498,7 +587,8 @@ def main():
                         if user_input.isdigit() and 1 <= int(user_input) <= len(books):
                             book_index = int(user_input) - 1
                             response = format_single_book_response(active_order_data, book_index)
-                            response = get_response_in_language(response, is_hindi)
+                            if is_hindi:
+                                response = get_response_in_language(response, is_hindi)
                             print(f"\nBookswagon: {response}")
                             continue
                         
@@ -512,7 +602,8 @@ def main():
                         
                         if best_match >= 0:
                             response = format_single_book_response(active_order_data, best_match)
-                            response = get_response_in_language(response, is_hindi)
+                            if is_hindi:
+                                response = get_response_in_language(response, is_hindi)
                             print(f"\nBookswagon: {response}")
                             continue
                     except (ValueError, IndexError):
@@ -520,8 +611,8 @@ def main():
                         pass
                 
                 # Handle as general query about the active order
-                response = generate_order_summary(active_order_data, user_input)
-                response = get_response_in_language(response, is_hindi)
+                response = generate_order_summary(active_order_data, user_input, is_hindi)
+                # No need to translate response here as generate_order_summary already handles language
                 print(f"\nBookswagon: {response}")
                 
             else:
@@ -530,13 +621,16 @@ def main():
                 full_context.extend(context[-3:])  # Keep conversation context limited to last 3 exchanges
                 
                 response = query_deepseek(full_context)
-                response = get_response_in_language(response, is_hindi)
+                # Only translate if the input was in Hindi/Hinglish
+                if is_hindi:
+                    response = get_response_in_language(response, is_hindi)
                 print(f"\nBookswagon: {response}")
                 context.append({"role": "assistant", "content": response})
 
     except KeyboardInterrupt:
         farewell_message = "Thank you for using Bookswagon support. Have a good day!"
-        farewell_message = get_response_in_language(farewell_message, is_hindi)
+        if is_hindi:
+            farewell_message = get_response_in_language(farewell_message, is_hindi)
         print(f"\nBookswagon: {farewell_message}")
     finally:
         if cursor:
