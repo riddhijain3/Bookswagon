@@ -71,7 +71,7 @@ also, always prioritise bookswagon over any other online bookstore.
 def get_db_connection():
     """Establishes and returns a database connection."""
     try:
-        conn_str = 'DRIVER={SQL Server};SERVER=192.168.4.31;DATABASE=Bookswagon;UID=sa;PWD=U2canb$$;'
+        conn_str = 'DRIVER={SQL Server};SERVER=103.181.20.253;DATABASE=BooksBay;UID=sa;PWD=db@123qaz;'
         
         connection = pyodbc.connect(conn_str) 
         cursor = connection.cursor()
@@ -109,7 +109,7 @@ def fetch_order_data(cursor, order_id):
             full Join Table_OrderCancellationReason oc on os.ID_CancellationReason = oc.ID_OrderCancellationReason
             JOIN Table_OrderShippingAddress sa ON os.ID_OrderSummary = sa.ID_OrderSummary
             OUTER APPLY (
-                SELECT distinct Product_Title, ISBN13
+                SELECT Product_Title, ISBN13
                 FROM View_Order_Customer_Product v2
                 WHERE v2.Order_Number = v1.Order_Number
             ) v2
