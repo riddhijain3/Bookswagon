@@ -201,7 +201,7 @@ def extract_order_id(text):
         {"role": "system", "content": "Extract Bookswagon order ID (UR or BW followed by digits) from text or return 'None'."},
         {"role": "user", "content": f"Extract order ID from: {text}"}
     ]
-    result = query_deepseek(messages).strip()
+    result = query_deepseek(messages).strip() 
     if result.upper() != "NONE" and (re.match(r'^UR\d+$', result, re.IGNORECASE) or re.match(r'^BW\d+$', result, re.IGNORECASE)):
         return result.upper()
     return None
@@ -219,7 +219,7 @@ def format_order_response(order_data):
     if isinstance(purchase_date, datetime):
         purchase_date = purchase_date.strftime("%d/%m/%Y")
     
-    promise_date = order_details.get('promise_date', 'Unknown')
+    promise_date = order_details.get('promise_date', 'Unknown') 
     if isinstance(promise_date, datetime):
         promise_date = promise_date.strftime("%d/%m/%Y")
     
@@ -302,6 +302,13 @@ def detect_language(text):
         - "मेरा ऑर्डर कैंसल क्यों हुआ"
         - "order kab milega"
         - "kitne din me aayega mera order"
+        
+        xample texts that should be classified as 'english':
+        - "Why my order got cancelled?"
+        - "Hey, Hie, yo, wassup"
+        - "When will I receive my order?"
+        - "How long does it take to deliver my order"?
+        - "order no BW1234567890"
         
         Text: "{text}"
         
