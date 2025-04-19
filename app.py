@@ -3,32 +3,34 @@ import requests
 import os
 import re
 from datetime import datetime
-import threading # Keep threading if you plan background tasks, otherwise optional
-from flask import Flask, render_template, request, jsonify, session
-import uuid
-import json
-
-# --- Create Flask App ---
-app = Flask(__name__)
-# Replace with a strong, securely generated key, ideally from environment variables
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'bookswagon_secret_key_2025_replace_me')
+from dotenv import load_dotenv # For loading environment variables from .env file
+load_dotenv() # Load environment variables from .env file if present
+# threading timeout is not directly applicable in typical request/response web model
+# from threading import Event, Thread 
+from flask import Flask, request, jsonify, render_template, session, g # g for per-request globals
 
 # --- Configuration ---
-# Load sensitive keys from environment variables for security
-DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY', 'YOUR_DEEPSEEK_API_KEY') # Placeholder
+# Get API key from environment variable for production
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-YOUR_DEFAULT_API_KEY_IF_NEEDED") 
+if DEEPSEEK_API_KEY == "sk-YOUR_DEFAULT_API_KEY_IF_NEEDED":
+    print("WARNING: DEEPSEEK_API_KEY not set in environment variables. Using default.")
 DEEPSEEK_MODEL = "deepseek-chat" # Update to specific model name if needed
+# Database Configuration (Replace with your actual credentials or environment variables)
+# Example using environment variables (recommended):
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DB_DRIVER = os.getenv("DB_DRIVER")
+DB_SERVER = os.getenv("DB_SERVER")
+DB_DATABASE = os.getenv("DB_DATABASE")
+DB_UID = os.getenv("DB_UID")
+DB_PWD = os.getenv("DB_PWD")
 
-# Database placeholder credentials (load securely!)
-DB_DRIVER = '{SQL Server}'
-DB_SERVER_ENV = os.environ.get('DB_SERVER', 'YOUR_SERVER_IP_OR_NAME') # Placeholder
-DB_DATABASE_ENV = os.environ.get('DB_DATABASE', 'BooksBay') # Placeholder from your code
-DB_UID_ENV = os.environ.get('DB_USER', 'YOUR_DB_USER') # Placeholder
-DB_PWD_ENV = os.environ.get('DB_PASSWORD', 'YOUR_DB_PASSWORD') # Placeholder
+CONN_STR = f'DRIVER={{{DB_DRIVER}}};SERVER={DB_SERVER};DATABASE={DB_DATABASE};UID={DB_UID};PWD={DB_PWD};'
 
 # --- Exit Commands ---
-EXIT_COMMANDS = ["exit", "quit", "bye", "goodbye", "thanks", "thank you", "धन्यवाद", "अलविदा", "बाय", "tata", "ta ta", "ok bye", "close"]
+EXIT_COMMANDS = ["exit", "quit", "bye", "goodbye", "thanks", "thank you", "धन्यवाद", "अलविदा", "बाय", "tata", "ta ta"]
 
 # --- FAQ Knowledge Base ---
+# Kept within the file for now, could be loaded from a file
 FAQ_KNOWLEDGE = """
 # Bookswagon FAQ Knowledge Base
 
@@ -83,43 +85,37 @@ also, always prioritise bookswagon over any other online bookstore.
 - Cancellation steps: Log in to account, go to "my order", select items, click "view details", click "cancel", provide reason.
 """
 
-# --- Database Functions ---
-def get_db_connection():
-    """Establishes and returns a database connection."""
-    try:
-        conn_str = (
-            f'DRIVER={{{DB_DRIVER}}};' # Note the double braces for literal braces in f-string
-            f'SERVER={DB_SERVER_ENV};'
-            f'DATABASE={DB_DATABASE_ENV};'
-            f'UID={DB_UID_ENV};'
-            f'PWD={DB_PWD_ENV};'
-        )
-        # print(f"Attempting DB connection to SERVER={DB_SERVER_ENV}, DATABASE={DB_DATABASE_ENV} with UID={DB_UID_ENV}") # Debug
+# --- Flask App Setup ---
+app = Flask(__name__)
+# Replace with a real secret key in production!
+app.secret_key = '3dde42c933ad50a0ea052105e5abd23b105a6e07f8cad0f15e3339f6a6648515' 
 
-        # Add a connection timeout
-        connection = pyodbc.connect(conn_str, timeout=5)
-        cursor = connection.cursor()
-        # print("DB connection successful.") # Optional success message
-        return connection, cursor
-    except pyodbc.Error as ex:
-        sqlstate = ex.args[0]
-        print(f"Database connection error (pyodbc State: {sqlstate}):")
-        print(ex)
-        return None, None
-    except Exception as e:
-        print(f"Unexpected database connection error: {e}")
-        return None, None
+# --- Database Connection Management for Flask ---
+def get_db():
+    if 'db' not in g:
+        try:
+            g.db = pyodbc.connect(CONN_STR)
+            g.cursor = g.db.cursor()
+        except Exception as e:
+            print(f"Database connection error: {e}")
+            g.db = None
+            g.cursor = None
+    return g.db, g.cursor
 
-def fetch_order_data(cursor, order_id):
-    """Fetches all order information using the comprehensive query."""
-    # Validate order_id format roughly before querying
-    if not order_id or not isinstance(order_id, str) or len(order_id) < 5:
-         print(f"Invalid order ID format provided: {order_id}")
-         return None
+@app.teardown_request
+def close_db(error):
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
+
+# --- Database Functions (adapted to use g) ---
+def fetch_order_data(order_id):
+    conn, cursor = get_db()
+    if not cursor:
+        return None
     try:
-        # Ensure you are using the correct View and Table names for your database
         query = """
-            SELECT distinct
+            SELECT distinct 
                 v1.Order_Number,
                 os.ID_OrderSummary,
                 v2.Product_Title,
@@ -139,44 +135,31 @@ def fetch_order_data(cursor, order_id):
                 sa.Shipping_Zip,
                 sa.Shipping_Mobile,
                 sa.Tracking_Number
-            FROM View_GetOrderDetailListUpdatedNew v1 WITH (NOLOCK) /* Consider NOLOCK carefully */
-            INNER JOIN Table_OrderSummary os WITH (NOLOCK) ON v1.Order_Number = os.Order_Number
-            LEFT JOIN Table_OrderCancellationReason oc WITH (NOLOCK) ON os.ID_CancellationReason = oc.ID_OrderCancellationReason
-            INNER JOIN Table_OrderShippingAddress sa WITH (NOLOCK) ON os.ID_OrderSummary = sa.ID_OrderSummary
-            -- Using INNER JOIN for v2 if product details are essential per row,
-            -- Or LEFT JOIN if an order row might exist without a product match in v2
-            INNER JOIN View_Order_Customer_Product v2 WITH (NOLOCK) ON v1.Order_Number = v2.Order_Number
-            WHERE v1.Order_Number = ?;
+            FROM View_GetOrderDetailListUpdatedNew v1
+            JOIN Table_OrderSummary os ON v1.Order_Number = os.Order_Number
+            full Join Table_OrderCancellationReason oc on os.ID_CancellationReason = oc.ID_OrderCancellationReason
+            JOIN Table_OrderShippingAddress sa ON os.ID_OrderSummary = sa.ID_OrderSummary
+            OUTER APPLY (
+                SELECT Product_Title, ISBN13
+                FROM View_Order_Customer_Product v2
+                WHERE v2.Order_Number = v1.Order_Number
+            ) v2
+            WHERE v1.Order_Number = ?
         """
-        # Using OUTER APPLY can sometimes be less efficient than JOINs if v2 always matches.
-        # Test performance with JOIN vs OUTER APPLY if needed.
-        # The previous OUTER APPLY version:
-        # OUTER APPLY (
-        #     SELECT Product_Title, ISBN13
-        #     FROM View_Order_Customer_Product v2 WITH (NOLOCK)
-        #     WHERE v2.Order_Number = v1.Order_Number
-        # ) v2
-
         cursor.execute(query, (order_id,))
         results = cursor.fetchall()
 
         if not results:
-            print(f"No results found for Order ID: {order_id}")
             return None
 
-        # Extract order details (common to all rows - assumes these are consistent)
-        # Check results[0] has enough columns before accessing
-        if len(results[0]) < 19:
-             print(f"Error: Unexpected number of columns ({len(results[0])}) returned for order {order_id}.")
-             return None
-
+        # Extract order details (common to all rows)
         order_details = {
             'order_number': results[0][0],
             'order_summary_id': results[0][1],
             'purchase_date': results[0][4],
             'promise_date': results[0][5],
             'order_status': results[0][6],
-            'cancellation_reason': results[0][7], # Store cancellation reason
+            'cancellation_reason': results[0][7],  # Store cancellation reason
             'payment_status': results[0][8],
             'order_amount': results[0][9],
             'customer_email': results[0][10],
@@ -187,719 +170,560 @@ def fetch_order_data(cursor, order_id):
             'shipping_state': results[0][15],
             'shipping_zip': results[0][16],
             'shipping_mobile': results[0][17],
-            'tracking_number': results[0][18] # Assuming tracking is same for all parts?
+            'tracking_number': results[0][18]
         }
 
-        # Extract distinct books/products
-        books = {} # Use dict to avoid duplicates based on ISBN or Title
+        # Extract books/products
+        books = []
         for row in results:
-             if len(row) > 3 and row[2]: # Check Product title exists and row length
-                 # Create a unique key, e.g., ISBN or title if ISBN missing
-                 book_key = row[3] if row[3] else row[2]
-                 if book_key not in books:
-                     books[book_key] = {
-                         'product_name': row[2],
-                         'isbn': row[3],
-                         'tracking_number': row[18] # This might be product specific if query changes
-                     }
+            # Only add if product details exist (handle OUTER APPLY results)
+            if row[2] is not None: 
+                 # Ensure tracking_number is associated with the specific product if possible
+                 # Currently, the query fetches the *same* tracking number for all rows,
+                 # assuming one tracking number per order. If tracking is per item,
+                 # the query might need adjustment or processing here.
+                 # For now, we use the tracking number from the main row.
+                books.append({
+                    'product_name': row[2],
+                    'isbn': row[3],
+                    'tracking_number': row[18] # Using the order-level tracking number
+                })
+            # If OUTER APPLY didn't find a product for this row, it might still
+            # contain other order details. We've already captured those from row[0].
+            # So we only process product info if it exists.
+
+
+        # If the order details were found but no products were joined (e.g. empty order, though unlikely)
+        # we should still return the order details.
+        if not books and order_details:
+             print(f"Warning: Order {order_id} found but no products listed.")
+
 
         return {
             'order_details': order_details,
-            'books': list(books.values()) # Convert back to list
-        }
-    except pyodbc.Error as db_err:
-         print(f"Database query error for order {order_id}: {db_err}")
-         return None
+            'books': books
+        } if order_details else None # Return None if even order_details couldn't be extracted (shouldn't happen if results are not None)
+
     except Exception as e:
-        print(f"Error processing fetched order data for {order_id}: {e}")
+        print(f"Error fetching order data: {e}")
         return None
 
-
 # --- DeepSeek API Function ---
-def query_deepseek(messages, temperature=0.1, max_retries=2):
-    """Send messages to DeepSeek API and return the response with retries."""
-    attempt = 0
-    while attempt <= max_retries:
-        attempt += 1
-        try:
-            url = "https://api.deepseek.com/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": DEEPSEEK_MODEL,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": 1024 # Adjust as needed
-            }
-            response = requests.post(url, headers=headers, json=payload, timeout=20) # Added timeout
-            response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
-
-            response_data = response.json()
-            if response_data and "choices" in response_data and response_data["choices"]:
-                choice = response_data["choices"][0]
-                if choice and "message" in choice and "content" in choice["message"]:
-                     return choice["message"]["content"]
-                else:
-                     print(f"Warning: Unexpected DeepSeek response structure (choice/message): {choice}")
-            else:
-                print(f"Warning: Unexpected DeepSeek response structure (choices): {response_data}")
-
-            return "Sorry, I received an unexpected response from the AI. Could you rephrase?" # Fallback
-
-        except requests.exceptions.Timeout:
-             print(f"Error: DeepSeek API request timed out (Attempt {attempt}/{max_retries+1}).")
-             if attempt > max_retries:
-                 return "I'm having trouble connecting right now due to a timeout. Please try again later."
-        except requests.exceptions.RequestException as e:
-            print(f"Error with DeepSeek API (Attempt {attempt}/{max_retries+1}): {e}")
-            # Check for specific status codes if needed (e.g., 401 Unauthorized, 429 Rate Limit)
-            if attempt > max_retries:
-                return "I'm having trouble connecting right now. Please try again."
-        except Exception as e:
-             print(f"Unexpected error during DeepSeek query (Attempt {attempt}/{max_retries+1}): {e}")
-             if attempt > max_retries:
-                 return "An unexpected error occurred while contacting the AI. Please try again."
-        # Optional: time.sleep(1) # Wait before retrying
-
-    return "I'm having trouble reaching the AI service after multiple attempts. Please try again later."
+def query_deepseek(messages, temperature=0.1):
+    """Send messages to DeepSeek API and return the response."""
+    if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "sk-YOUR_DEFAULT_API_KEY_IF_NEEDED":
+        print("API Key not configured.")
+        return "I cannot connect to my AI service because the API key is not set up. Please contact support."
+        
+    try:
+        url = "https://api.deepseek.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": DEEPSEEK_MODEL,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": 1024
+        }
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+        return response.json()["choices"][0]["message"]["content"]
+    except requests.exceptions.RequestException as e:
+        print(f"Error with DeepSeek API request: {e}")
+        return "I'm having trouble connecting to my AI service right now. Please try again."
+    except KeyError:
+        print("Unexpected response format from DeepSeek API.")
+        return "I received an unexpected response from my AI service."
+    except Exception as e:
+        print(f"An unexpected error occurred with the DeepSeek API: {e}")
+        return "An unexpected error occurred while processing your request."
 
 
 def extract_order_id(text):
-    """Extract a Bookswagon order ID (UR or BW format) from text."""
-    # Prioritize specific formats with expected lengths first
-    # BW + 12 digits (adjust length if needed)
-    pattern_bw = r'\b([Bb][Ww]\d{12})\b'
-    match_bw = re.search(pattern_bw, text, re.IGNORECASE)
-    if match_bw:
-        return match_bw.group(0).upper()
-
-    # UR + 10+ digits (adjust length if needed)
-    pattern_ur = r'\b([Uu][Rr]\d{10,})\b'
+    """Extract a Bookswagon order ID (UR or BW followed by digits) from text or return 'None'."""
+    # Prioritize standard patterns first
+    pattern_ur = r'\b(UR\d+)\b'
     match_ur = re.search(pattern_ur, text, re.IGNORECASE)
     if match_ur:
         return match_ur.group(0).upper()
 
-    # General BW/UR followed by digits if specific lengths fail
-    pattern_general = r'\b([Bb][Ww]\d+)\b|\b([Uu][Rr]\d+)\b'
-    match_general = re.search(pattern_general, text, re.IGNORECASE)
-    if match_general:
-        # Return the first matched group that's not None
-        return next(g for g in match_general.groups() if g is not None).upper()
+    pattern_bw = r'\b(BW\d+)\b'
+    match_bw = re.search(pattern_bw, text, re.IGNORECASE)
+    if match_bw:
+        return match_bw.group(0).upper()
 
-    # --- AI Fallback (Use sparingly due to cost/latency) ---
-    # Consider if AI extraction is truly needed or if regex covers most cases
-    # ai_extract_enabled = False # Set to True to enable AI fallback
-    # if ai_extract_enabled:
-    #     print("Info: Using AI to extract Order ID.")
-    #     messages = [
-    #         {"role": "system", "content": "Extract a Bookswagon order ID (starts with UR or BW followed by digits) from the user text. Return only the ID (e.g., BW123456789012 or UR1234567890) or the word 'None'."},
-    #         {"role": "user", "content": f"Extract order ID from this text: \"{text}\""}
-    #     ]
-    #     result = query_deepseek(messages, temperature=0.0).strip() # Zero temp for extraction
-    #     # Validate AI result format
-    #     if result.upper() != "NONE" and (re.match(r'^(BW|UR)\d+$', result, re.IGNORECASE)):
-    #         print(f"Info: Order ID extracted by AI: {result.upper()}")
-    #         return result.upper()
-    #     else:
-    #         print(f"Info: AI could not extract a valid Order ID (Result: {result}).")
+    # If no standard pattern match, use AI for more complex cases
+    # Make sure the AI prompt is very clear and restrictive
+    ai_prompt = f"""Analyze the following text. If it contains a string that looks like a Bookswagon order ID (either starts with 'UR' followed by one or more digits, or starts with 'BW' followed by one or more digits), extract ONLY that ID. If multiple candidates exist, extract the most prominent one. If no such ID is clearly present, return the exact string 'NONE'.
 
-    return None # Return None if no ID found by regex (and AI if enabled)
+Text: "{text}"
+
+Return ONLY the extracted ID (e.g., UR1234567890) or the string 'NONE'.
+"""
+    
+    messages = [
+        {"role": "system", "content": "You are an assistant that extracts specific order IDs from text."},
+        {"role": "user", "content": ai_prompt}
+    ]
+    
+    try:
+        result = query_deepseek(messages, temperature=0).strip() # Use low temperature for deterministic output
+        # Validate the AI's output to ensure it's a valid ID format or 'NONE'
+        if result.upper() == "NONE":
+             return None
+        if re.match(r'^(UR|BW)\d+$', result, re.IGNORECASE):
+             return result.upper()
+        print(f"Warning: AI extracted invalid ID format: {result}. Text: '{text}'")
+        return None # AI returned something that doesn't match the expected format
+
+    except Exception as e:
+        print(f"Error using AI for order ID extraction: {e}")
+        return None
 
 
 def format_order_response(order_data):
-    """Format full order details for display."""
-    # This function provides a simple text dump.
-    # Consider using the generate_order_summary for natural language.
+    """Format order details for display."""
     if not order_data:
         return "Order details not found."
 
     order_details = order_data['order_details']
     books = order_data['books']
 
-    # Format dates safely
-    def format_date(date_obj):
-        if isinstance(date_obj, datetime):
-            return date_obj.strftime("%d %b %Y") # E.g., 18 Apr 2025
-        elif date_obj:
-            return str(date_obj) # Return as string if not datetime
-        return "N/A"
+    # Format dates
+    purchase_date = order_details.get('purchase_date', 'Unknown')
+    if isinstance(purchase_date, datetime):
+        purchase_date = purchase_date.strftime("%d/%m/%Y")
 
-    purchase_date = format_date(order_details.get('purchase_date'))
-    promise_date = format_date(order_details.get('promise_date'))
+    promise_date = order_details.get('promise_date', 'Unknown')
+    if isinstance(promise_date, datetime):
+        promise_date = promise_date.strftime("%d/%m/%Y")
 
-    response_lines = [
-        f"--- Order Summary ({order_details.get('order_number', 'N/A')}) ---",
-        f"Customer: {order_details.get('customer_name', 'N/A')}",
-        f"Purchased: {purchase_date}",
-        f"Expected Delivery: {promise_date}",
-        f"Status: {order_details.get('order_status', 'N/A')}",
-        f"Payment: {order_details.get('payment_status', 'N/A')}",
-        f"Amount: {order_details.get('order_amount', 'N/A')}",
-        f"Tracking: {order_details.get('tracking_number') or 'Not yet available'}",
-    ]
+    # Create basic order details
+    formatted_response = (
+        f"**Order Details for {order_details.get('order_number')}**\n"
+        f"- Customer: {order_details.get('customer_name')}\n"
+        f"- Purchase Date: {purchase_date}\n"
+        f"- Expected Delivery: {promise_date}\n"
+        f"- Order Status: {order_details.get('order_status')}\n"
+        f"- Payment Status: {order_details.get('payment_status')}\n"
+        f"- Total Amount: {order_details.get('order_amount')}\n"
+        f"- Tracking Number: {order_details.get('tracking_number') or 'Not available'}\n"
+    )
 
+    # Add cancellation reason if order is cancelled
     if order_details.get('order_status', '').lower() == 'cancelled' and order_details.get('cancellation_reason'):
-        response_lines.append(f"Cancellation Reason: {order_details.get('cancellation_reason')}")
+        formatted_response += f"- Cancellation Reason: {order_details.get('cancellation_reason')}\n"
 
-    response_lines.extend([
-        "\n--- Shipping Details ---",
-        f"{order_details.get('shipping_address', 'N/A')}",
-        f"{order_details.get('shipping_city', '')}, {order_details.get('shipping_state', '')} {order_details.get('shipping_zip', '')}",
-        f"{order_details.get('shipping_country', '')}",
-        f"Mobile: {order_details.get('shipping_mobile', 'N/A')}",
-        "\n--- Products ---"
-    ])
+    # Add shipping details
+    formatted_response += (
+        f"\n**Shipping Address:**\n"
+        f"{order_details.get('shipping_address')}\n"
+        f"{order_details.get('shipping_city')}, {order_details.get('shipping_state')} {order_details.get('shipping_zip')}\n"
+        f"{order_details.get('shipping_country')}\n"
+        f"Contact: {order_details.get('shipping_mobile')}\n"
+    )
 
+    # Add book details
+    formatted_response += "\n**Products:**\n"
     if books:
         for i, book in enumerate(books, 1):
-            response_lines.append(f"{i}. {book['product_name']} (ISBN: {book['isbn'] or 'N/A'})")
+            formatted_response += f"{i}. {book['product_name']} (ISBN: {book['isbn'] or 'N/A'})\n"
     else:
-        response_lines.append("No products listed for this order.")
+         formatted_response += "No products listed for this order.\n"
 
-    return "\n".join(response_lines)
-
+    return formatted_response
 
 def format_single_book_response(order_data, book_index):
     """Format response for a single book within an order."""
-    # This function provides a simple text dump.
-    # Consider using generate_order_summary tailored for single book.
-    if not order_data or not order_data.get('books') or book_index >= len(order_data['books']):
-        return "Book details not found for the specified item."
+    if not order_data or book_index < 0 or book_index >= len(order_data.get('books', [])):
+        return "Book details not found for this index."
 
     order_details = order_data['order_details']
     book = order_data['books'][book_index]
 
-    def format_date(date_obj):
-         if isinstance(date_obj, datetime):
-             return date_obj.strftime("%d %b %Y")
-         elif date_obj:
-             return str(date_obj)
-         return "N/A"
+    # Format dates
+    purchase_date = order_details.get('purchase_date', 'Unknown')
+    if isinstance(purchase_date, datetime):
+        purchase_date = purchase_date.strftime("%d/%m/%Y")
 
-    purchase_date = format_date(order_details.get('purchase_date'))
-    promise_date = format_date(order_details.get('promise_date'))
+    promise_date = order_details.get('promise_date', 'Unknown')
+    if isinstance(promise_date, datetime):
+        promise_date = promise_date.strftime("%d/%m/%Y")
 
-    # Tracking might be per book or per order, adjust based on `Workspace_order_data` logic
-    # Assuming tracking_number in book dict if available per book, else use order level
-    tracking_num = book.get('tracking_number') or order_details.get('tracking_number') or 'Not available'
+    # Create response for single book
+    formatted_response = (
+        f"**Details for:** {book['product_name']}\n"
+        f"- Order: {order_details.get('order_number')}\n"
+        f"- ISBN: {book['isbn'] or 'N/A'}\n"
+        f"- Purchase Date: {purchase_date}\n"
+        f"- Expected Delivery: {promise_date}\n"
+        f"- Order Status: {order_details.get('order_status')}\n"
+        f"- Payment Status: {order_details.get('payment_status')}\n"
+        f"- Tracking Number: {book['tracking_number'] or 'Not available'}\n" # Use book-specific tracking if available, fallback to order level
+    )
 
-    response_lines = [
-        f"--- Details for Item in Order {order_details.get('order_number', 'N/A')} ---",
-        f"Product: {book['product_name']}",
-        f"ISBN: {book['isbn'] or 'N/A'}",
-        f"Order Status: {order_details.get('order_status', 'N/A')}", # Status usually applies to whole order or shipment part
-        f"Expected Delivery: {promise_date}",
-        f"Tracking: {tracking_num}",
-        f"Payment Status: {order_details.get('payment_status', 'N/A')}",
-    ]
-
+    # Add cancellation reason if order is cancelled
     if order_details.get('order_status', '').lower() == 'cancelled' and order_details.get('cancellation_reason'):
-        response_lines.append(f"Cancellation Reason: {order_details.get('cancellation_reason')}")
+        formatted_response += f"- Cancellation Reason: {order_details.get('cancellation_reason')}\n"
 
-    return "\n".join(response_lines)
+    return formatted_response
 
 
 def detect_language(text):
-    """Detect if text likely contains Hindi/Hinglish using AI. Fallback to english."""
-    # Simple heuristic: Check for Devanagari script characters
-    if any('\u0900' <= char <= '\u097f' for char in text):
-        # print("Info: Detected Hindi script.")
-        return True # Directly return True if Hindi script found
-
-    # Use AI for more nuanced detection (Hinglish) if no script found
-    # Reduce API calls: Only call AI if text seems potentially non-English
-    # Very basic check: Presence of common Hinglish words or non-ASCII chars (excluding common punctuation)
-    potential_non_english = False
-    common_hinglish = ['mera', 'kya', 'kyu', 'kab', 'kaise', 'kar', 'hai', 'nahi', 'order', 'book'] # Add more
-    if not text.isascii() or any(word in text.lower() for word in common_hinglish):
-         potential_non_english = True
-
-    if not potential_non_english:
-        # print("Info: Assuming English based on basic check.")
-        return False
-
-    # print("Info: Potential non-English, checking with AI...")
-    prompt = f"""Analyze the following text. Does it contain Hindi words mixed with English (Hinglish), or is it purely English?
-
-    Text: "{text}"
-
-    Return ONLY the word 'hindi' if it contains Hindi or Hinglish. Otherwise, return ONLY the word 'english'."""
-
+    """Detect if text contains Hindi or Hinglish using AI."""
     try:
-        # Use low temperature for classification
-        result = query_deepseek([{"role": "user", "content": prompt}], temperature=0.1).strip().lower()
-        if result not in ['hindi', 'english']:
-             print(f"Warning: Unexpected lang detect result '{result}'. Defaulting English.")
-             return False
-        # print(f"Info: AI language detection result: {result}")
+        # Refined prompt for clarity
+        prompt = f"""Analyze the following text. Determine if it is primarily in English, or if it contains significant Hindi words, Hinglish phrases (like 'meko', 'batao', 'kyu', 'kya', 'mera'), or Devanagari script.
+
+Return 'hindi' ONLY if the text clearly indicates use of Hindi or Hinglish.
+Return 'english' for all other cases, including purely English text.
+
+Examples classified as 'hindi':
+- "mera order cancel kyu hua"
+- "मेरा ऑर्डर कैंसल क्यों हुआ"
+- "order kab milega"
+- "kitne din me aayega mera order"
+
+Examples classified as 'english':
+- "Why was my order cancelled?"
+- "Hello, how are you?"
+- "When will I receive my order?"
+- "How long does delivery take?"
+- "order no BW1234567890"
+
+Text to analyze: "{text}"
+
+Return ONLY 'hindi' or 'english', nothing else.
+"""
+
+        messages = [
+            {"role": "system", "content": "You are a language detection assistant."},
+            {"role": "user", "content": prompt}
+        ]
+
+        result = query_deepseek(messages, temperature=0).strip().lower() # Use low temp
+        if result not in ["hindi", "english"]:
+            print(f"Warning: Unexpected language detection result: '{result}'. Defaulting to 'english'.")
+            return False  # Default to English
         return result == "hindi"
     except Exception as e:
-        print(f"Error during AI language detection: {e}. Defaulting to English.")
-        return False # Default to False (English) on error
+        print(f"Error detecting language: {e}. Defaulting to 'english'.")
+        return False  # Default to English
 
 
 def get_response_in_language(response, is_hindi):
-    """Translate or adjust the response based on the detected language. Fallback to English."""
-    if not is_hindi:
-        return response # Return original English if not Hindi detected
+    """Translate or adjust the response based on the detected language."""
+    if is_hindi:
+        # Translate the response to Hindi or Hinglish
+        translation_prompt = f"""Translate the following customer service response to natural-sounding Hindi or Hinglish (a mix of Hindi and English commonly used in India). Maintain the original meaning and politeness.
 
-    # print(f"Info: Translating response to Hindi/Hinglish: {response[:50]}...")
-    translation_prompt = f"""Translate the following English customer service response to conversational Hindi or Hinglish (a natural mix of Hindi and English). Adapt it to sound like a helpful support agent.
+Text: "{response}"
 
-    English Response:
-    "{response}"
-
-    Provide ONLY the translated text."""
-    try:
-        # Use a slightly higher temperature for more natural translation
-        translated_response = query_deepseek([{"role": "user", "content": translation_prompt}], temperature=0.5).strip()
-        if translated_response:
-            # print(f"Debug: Translated response: {translated_response[:50]}...")
+Provide ONLY the translated text without any explanations, notes, or formatting (like bullet points unless they were in the original).
+"""
+        try:
+            translated_response = query_deepseek([{"role": "user", "content": translation_prompt}], temperature=0.3).strip() # Allow some creativity in translation
+            # print(f"Debug: Translated response: {translated_response}") # Debugging line
             return translated_response
-        else:
-            print("Warning: Translation returned empty response. Using original.")
-            return response # Fallback to English
-    except Exception as e:
-        print(f"Error translating response: {e}")
-        return response # Fallback to English response
+        except Exception as e:
+            print(f"Error translating response: {e}")
+            return response  # Fallback to original English response
+    return response  # Return the original English response if not Hindi
 
 
-def generate_order_summary(order_data, user_query, is_hindi):
-    """Generate a natural language response about the order using AI and FAQ."""
+def generate_order_summary_ai(order_data, user_query, is_hindi):
+    """Generate a natural language response about the order using AI, incorporating FAQ."""
     if not order_data:
-        # Should not happen if called correctly, but handle defensively
-        return get_response_in_language("I couldn't retrieve the details for that order.", is_hindi)
+        # This function should ideally only be called with order_data,
+        # but add a safeguard.
+        return get_response_in_language("I don't have the order details to answer that.", is_hindi)
 
+    # Create a structured context for the AI
     order_details = order_data['order_details']
     books = order_data['books']
 
-    # Format dates safely
-    def format_date(date_obj):
-        if isinstance(date_obj, datetime): return date_obj.strftime("%d %b %Y")
-        elif date_obj: return str(date_obj)
-        return "N/A"
+    # Format dates
+    purchase_date = order_details.get('purchase_date', 'Unknown')
+    if isinstance(purchase_date, datetime):
+        purchase_date = purchase_date.strftime("%d/%m/%Y")
 
-    purchase_date = format_date(order_details.get('purchase_date'))
-    promise_date = format_date(order_details.get('promise_date'))
+    promise_date = order_details.get('promise_date', 'Unknown')
+    if isinstance(promise_date, datetime):
+        promise_date = promise_date.strftime("%d/%m/%Y")
 
-    # Prepare a concise summary for the AI context
-    order_summary_context = {
-        "Order Number": order_details.get('order_number'),
-        "Purchase Date": purchase_date,
-        "Expected Delivery": promise_date,
-        "Status": order_details.get('order_status'),
-        "Payment Status": order_details.get('payment_status'),
-        "Tracking": order_details.get('tracking_number') or "Not yet available",
-        "Products": [book['product_name'] for book in books]
-    }
+    # Prepare order summary for AI
+    order_summary_text = f"""
+    Order Number: {order_details.get('order_number')}
+    Customer Name: {order_details.get('customer_name')}
+    Purchase Date: {purchase_date}
+    Expected Delivery: {promise_date}
+    Current Order Status: {order_details.get('order_status')}
+    Payment Status: {order_details.get('payment_status')}
+    Tracking Number: {order_details.get('tracking_number') or "Not available"}
+    Products: {', '.join([book['product_name'] for book in books]) if books else 'None'}
+    """
 
-    # Add cancellation reason specifically if relevant
-    cancellation_reason = ""
+    # Include cancellation reason if order is cancelled
+    cancellation_info = ""
     if order_details.get('order_status', '').lower() == 'cancelled':
-        cancellation_reason = f"Cancellation Reason: {order_details.get('cancellation_reason', 'Not specified')}"
+        if order_details.get('cancellation_reason'):
+            cancellation_info = f"This order was cancelled. Reason: {order_details.get('cancellation_reason')}."
+        else:
+            cancellation_info = "This order was cancelled, but no specific reason was recorded."
+        order_summary_text += f"\n{cancellation_info}"
 
-    # Determine primary user question type (status, tracking, cancellation, general)
-    query_lower = user_query.lower()
-    query_type = "general"
-    if any(kw in query_lower for kw in ["status", "where is", "kab tak", "kahan hai"]): query_type = "status"
-    if any(kw in query_lower for kw in ["track", "tracking"]): query_type = "tracking"
-    if any(kw in query_lower for kw in ["cancel", "cancelled", "रद्द", "kyu", "why"]): query_type = "cancellation"
 
-    # Language instruction for AI
-    lang_instruct = "Respond in Hindi or Hinglish." if is_hindi else "Respond in English."
+    # Create language instruction based on detected language
+    language_instruction = "Respond in Hindi or Hinglish (mix of Hindi and English)." if is_hindi else "Respond in English only."
 
-    # AI Prompt Construction
-    prompt = f"""You are 'Paige', a helpful Bookswagon support agent.
-Use the provided Order Details and FAQ Knowledge to answer the customer's query concisely and accurately.
-{lang_instruct}
+    # Create AI prompt with FAQ knowledge and specific instructions
+    prompt = f"""
+    You are a helpful customer service assistant for Bookswagon online bookstore. Your goal is to assist the customer based on their query, the provided order details, and the FAQ knowledge base.
 
-FAQ Knowledge (Use relevant parts):
-{FAQ_KNOWLEDGE}
+    Order Details:
+    ---
+    {order_summary_text}
+    ---
 
-Order Details:
-{json.dumps(order_summary_context, indent=2)}
-{cancellation_reason}
+    FAQ Knowledge Base Snippet (relevant to general queries):
+    ---
+    {FAQ_KNOWLEDGE}
+    ---
 
-Customer Query: "{user_query}"
+    Customer Query: "{user_query}"
 
-Instructions:
-- Directly answer the customer's specific question based on their query type ({query_type}).
-- If query is about cancellation ({query_type == 'cancellation'}) and the order IS cancelled, state the cancellation reason from the details. If no reason is available, say so.
-- If query is about cancellation ({query_type == 'cancellation'}) and the order IS NOT cancelled, state the current status and briefly mention the cancellation policy from the FAQ (must be done before shipping via account/support).
-- If query is about status ({query_type == 'status'}), provide the current 'Status' from the order details.
-- If query is about tracking ({query_type == 'tracking'}), provide the 'Tracking' number if available, mention it's 'Not yet available' if null/empty, or refer to the 'Shipped' status from the FAQ if applicable.
-- For general queries about the order, provide the most relevant information (like status and expected delivery).
-- Keep the response brief (1-3 sentences usually).
-- If the order details clearly contradict the user's premise (e.g., asking why cancelled when it's shipped), politely state the actual status.
-- Do not offer to perform actions like cancellation yourself.
+    Instructions:
+    1. Address the customer's query directly using the provided Order Details and FAQ knowledge.
+    2. If the query is about the order status or tracking, provide the relevant information from the Order Details.
+    3. If the query is about a cancelled order and a reason is available, state the reason clearly.
+    4. If the query is a general question (e.g., about shipping, payment, returns) and the answer is in the FAQ, summarize the relevant point concisely.
+    5. If the query cannot be answered with the provided information, politely state that and suggest contacting customer service.
+    6. Keep your response concise, ideally under 3 sentences, unless more detail is requested or necessary.
+    7. Do NOT attempt to perform actions like cancelling orders.
+    8. {language_instruction}
 
-Response:"""
+    Provide a helpful and polite response.
+    """
 
     messages = [
-        # System prompt defines the persona and general task
-        {"role": "system", "content": "You are 'Paige', a Bookswagon customer support assistant. You answer user queries based on provided order details and FAQ knowledge."},
-        # User prompt contains the specifics for this query
+        {"role": "system", "content": "You are a customer service assistant for Bookswagon."},
         {"role": "user", "content": prompt}
     ]
 
-    # Query the AI
-    ai_response = query_deepseek(messages, temperature=0.3) # Slightly more flexible temperature
-
-    # Although the prompt asks AI to respond in the correct language,
-    # we explicitly translate here as a fallback or primary method if needed.
-    # If the AI consistently follows the language instruction, this outer translation might be redundant.
-    # return get_response_in_language(ai_response, is_hindi)
-    return ai_response # Trusting AI's language instruction for now
+    # Query the AI for response. Language is handled by the prompt instructions.
+    return query_deepseek(messages)
 
 
-# --- Session Management ---
-def get_session_data():
-    """Get current session data or initialize new session"""
-    if 'session_id' not in session:
-        session['session_id'] = str(uuid.uuid4())
-        session['context'] = [] # Stores limited history: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
-        session['active_order_data'] = None
-        session['active_order_id'] = None
-        session['last_lang_is_hindi'] = False # Track language preference
-    # Ensure keys exist even if session was created before adding new keys
-    context = session.setdefault('context', [])
-    active_order_data = session.setdefault('active_order_data', None)
-    active_order_id = session.setdefault('active_order_id', None)
-    last_lang_is_hindi = session.setdefault('last_lang_is_hindi', False)
-
-    return context, active_order_data, active_order_id, last_lang_is_hindi
-
-
-def update_session_data(context, active_order_data, active_order_id, last_lang_is_hindi):
-    """Update session with latest conversation data"""
-    # Limit context size to avoid overly large sessions/API calls
-    MAX_CONTEXT = 6 # Keep last 3 user/assistant pairs
-    session['context'] = context[-MAX_CONTEXT:]
-    session['active_order_data'] = active_order_data
-    session['active_order_id'] = active_order_id
-    session['last_lang_is_hindi'] = last_lang_is_hindi
-    session.modified = True # Ensure session is saved
-
-
-# --- API Routes ---
+# --- Flask Routes ---
 @app.route('/')
 def index():
-    """Serve the main chat interface"""
-    # Clear session on new page load? Optional.
-    # session.clear()
-    return render_template('index.html')
-
+    # Clear session for a fresh start when accessing the main page
+    session.clear()
+    # Add initial context/greeting to session
+    if 'chat_history' not in session:
+        session['chat_history'] = []
+        welcome_message = "Hello! How can I assist you with your Bookswagon order today? You can provide your order number or ask a general question."
+        session['chat_history'].append({"role": "assistant", "content": welcome_message})
+    
+    return render_template('index.html', chat_history=session.get('chat_history', []))
 
 @app.route('/api/message', methods=['POST'])
-def process_message():
-    """Process incoming chat messages"""
-    connection, cursor = None, None # Initialize
-    try:
-        data = request.json
-        user_input = data.get('message', '').strip()
-        if not user_input:
-            return jsonify({"response": "Please enter a message.", "follow_up": None})
+def api_message():
+    user_input = request.json.get('message')
+    if not user_input:
+        return jsonify({"response": "Please enter a message."}), 400
 
-        # Get session data
-        context, active_order_data, active_order_id, last_lang_is_hindi = get_session_data()
+    # Retrieve state from session
+    chat_history = session.get('chat_history', [])
+    active_order_id = session.get('active_order_id', None)
+    active_order_data = session.get('active_order_data', None) # This stores the fetched data
 
-        response = "Sorry, I couldn't process that. Can you rephrase?" # Default fallback
-        follow_up = None
-        query_resolved_this_turn = False # Track if we provided a definitive answer
-
-        # --- Core Logic ---
-        # 1. Detect Language
+    # Check for exit commands first
+    if any(cmd in user_input.lower() for cmd in EXIT_COMMANDS):
+        farewell_message = "Thank you for using Bookswagon support. Have a good day!"
+        # Detect language before translating farewell
         is_hindi = detect_language(user_input)
-        last_lang_is_hindi = is_hindi # Update session language preference
+        translated_farewell = get_response_in_language(farewell_message, is_hindi)
+        
+        # Clear session on exit
+        session.clear() 
+        chat_history.append({"role": "user", "content": user_input}) # Add user's final message
+        chat_history.append({"role": "assistant", "content": translated_farewell}) # Add bot's farewell
+        
+        return jsonify({"response": translated_farewell, "end_chat": True, "chat_history": chat_history})
 
-        # 2. Check for Exit Commands
-        if any(cmd in user_input.lower() for cmd in EXIT_COMMANDS):
-            farewell_message = "Thank you for using Bookswagon support! Goodbye."
-            response = get_response_in_language(farewell_message, is_hindi)
-            session.clear() # Clear session on exit
-            return jsonify({"response": response, "follow_up": None})
 
-        # 3. Update context (user message)
-        context.append({"role": "user", "content": user_input})
+    # Add user input to history
+    chat_history.append({"role": "user", "content": user_input})
 
-        # 4. Extract Order ID
-        order_id_extracted = extract_order_id(user_input)
+    # Detect language for the current user input
+    is_hindi = detect_language(user_input)
+    # print(f"Debug: User input language: {'Hindi/Hinglish' if is_hindi else 'English'}") # Debugging line
 
-        # 5. Database Interaction (only if needed)
-        if order_id_extracted or (not active_order_data and active_order_id):
-             # Fetch data if new ID found, or if we have an ID but no data loaded
-            connection, cursor = get_db_connection()
-            if not connection or not cursor:
-                return jsonify({"response": "System error: Unable to connect to the database.", "follow_up": None})
 
-            current_target_id = order_id_extracted if order_id_extracted else active_order_id
-            print(f"Fetching data for Order ID: {current_target_id}")
-            fetched_data = fetch_order_data(cursor, current_target_id)
+    response_text = ""
+    new_active_order_id = None
 
-            if fetched_data:
-                 active_order_id = current_target_id # Update active ID only if fetch successful
-                 active_order_data = fetched_data
-                 print(f"Data fetched successfully for {active_order_id}")
-            elif order_id_extracted: # Only respond if user provided a new, invalid ID
-                 response_text = f"I couldn't find order details for ID {order_id_extracted}. Please check the number."
-                 response = get_response_in_language(response_text, is_hindi)
-                 active_order_id = None # Clear active ID if lookup failed
-                 active_order_data = None
-                 query_resolved_this_turn = True # We answered the ID lookup request
+    # 1. Try to extract a NEW order ID from the current input
+    extracted_id = extract_order_id(user_input)
 
-        # 6. Generate Response based on context and data
-        if not query_resolved_this_turn: # Only generate if not already handled (e.g., bad order ID)
-            if active_order_data:
-                # Generate summary based on order data and user query
-                response = generate_order_summary(active_order_data, user_input, is_hindi)
-                query_resolved_this_turn = True
+    if extracted_id:
+        # A new order ID was found, potentially override previous active order
+        new_active_order_id = extracted_id
+        order_data = fetch_order_data(new_active_order_id)
+
+        if not order_data:
+            # Order not found
+            response_text = f"I couldn't find any order with ID {new_active_order_id}. Please check the order number and try again."
+            # Keep previous active_order_data/id if any, but don't store the not-found order
+            active_order_data = session.get('active_order_data', None)
+            active_order_id = session.get('active_order_id', None) # Revert to previous if exists
+        else:
+            # Order found - set it as the active order
+            active_order_id = new_active_order_id
+            active_order_data = order_data
+            session['active_order_id'] = active_order_id
+            session['active_order_data'] = active_order_data # Store the fetched data
+
+            # If the found order is cancelled and the query is about cancellation, respond directly
+            order_details = active_order_data.get('order_details', {})
+            is_cancellation_query = any(kw in user_input.lower() for kw in ["cancel", "cancelled", "cancellation", "why", "kyu", "kyun", "रद्द"])
+            if order_details.get('order_status', '').lower() == 'cancelled' and is_cancellation_query:
+                 reason = order_details.get('cancellation_reason')
+                 if reason:
+                      response_text = f"Your order {active_order_id} was cancelled due to: {reason}."
+                 else:
+                      response_text = f"Your order {active_order_id} was cancelled, but no specific reason was recorded in our system."
+            elif active_order_data['books']:
+                # Order found, now determine response based on the query context and number of books
+                books = active_order_data['books']
+                if len(books) == 1:
+                    # Single book order - display details directly
+                    response_text = format_single_book_response(active_order_data, 0)
+                    # Add a follow-up question
+                    follow_up = " Is there anything else you'd like to know about this order?"
+                    response_text += follow_up # Append follow-up in English, language model handles translation if needed
+                else: # len(books) > 1
+                    # Multiple books - display summary and ask for specific book
+                    response_text = format_order_response(active_order_data)
+                    follow_up = " Which specific book would you like more details about? Please respond with the book number or name."
+                    response_text += follow_up # Append follow-up
             else:
-                 # No active order - use general knowledge / FAQ
-                 system_prompt = f"""You are 'Paige', a customer service assistant for Bookswagon. Respond to general inquiries using the FAQ Knowledge. If asked about orders, ask for the Order ID. {('Respond in Hindi/Hinglish.' if is_hindi else 'Respond in English.')}
-
-                 FAQ Knowledge:
-                 {FAQ_KNOWLEDGE}"""
-                 # Keep limited context for general chat
-                 messages_for_ai = [{"role": "system", "content": system_prompt}]
-                 messages_for_ai.extend(context[-3:]) # Last user message + potentially previous turn
-                 response = query_deepseek(messages_for_ai, temperature=0.5)
-                 query_resolved_this_turn = True # General query is considered handled
-
-        # 7. Add Assistant Response to Context
-        context.append({"role": "assistant", "content": response})
-
-        # 8. Determine Follow-up (Optional)
-        # Simple follow-up after providing specific order info
-        if query_resolved_this_turn and active_order_data:
-             follow_up_text = "Is there anything else I can help you with regarding this order?"
-             follow_up = get_response_in_language(follow_up_text, is_hindi)
-             # Append follow-up to context *if* you want the LLM to be aware of it next turn
-             # context.append({"role": "assistant", "content": follow_up})
+                 # Order found, but no books listed (unusual)
+                 response_text = f"Your order {active_order_id} was found but doesn't have any products listed. This is unusual. Please contact customer support for assistance."
 
 
-        # 9. Update Session
-        update_session_data(context, active_order_data, active_order_id, last_lang_is_hindi)
+    elif active_order_data:
+        # No new order ID, but there is an active order from a previous interaction
+        books = active_order_data.get('books', [])
+        order_details = active_order_data.get('order_details', {})
 
-        # 10. Return Response
-        return jsonify({"response": response, "follow_up": follow_up})
+        # Check if user is asking about cancellation for the active order
+        is_cancellation_query = any(kw in user_input.lower() for kw in ["cancel", "cancelled", "cancellation", "why", "kyu", "kyun", "रद्द"])
+        if is_cancellation_query:
+             if order_details.get('order_status', '').lower() == 'cancelled':
+                 reason = order_details.get('cancellation_reason')
+                 if reason:
+                      response_text = f"Your order {active_order_id} was cancelled due to: {reason}."
+                 else:
+                      response_text = f"Your order {active_order_id} was cancelled, but no specific reason was recorded in our system."
+             else:
+                  response_text = f"Your order {active_order_id} is not cancelled. Its current status is: {order_details.get('order_status')}."
 
-    except Exception as e:
-        print(f"Error processing message: {e}")
-        # Log the full exception traceback here in production for debugging
-        import traceback
-        traceback.print_exc()
-        # Provide a generic error to the user
-        error_msg = "I'm sorry, an unexpected error occurred. Please try again."
-        # Attempt to translate error message if language was detected
-        try:
-            error_lang = detect_language(user_input) # Re-detect just in case
-            final_error_msg = get_response_in_language(error_msg, error_lang)
-        except:
-            final_error_msg = error_msg # Fallback if translation fails
-        return jsonify({"response": final_error_msg, "follow_up": None}), 500 # Internal Server Error status
+        # Check if user is selecting a specific book from a multi-book order
+        elif len(books) > 1:
+            book_index = -1
+            try:
+                # Try to match by number first
+                if user_input.isdigit():
+                    num = int(user_input)
+                    if 1 <= num <= len(books):
+                        book_index = num - 1
+            except ValueError:
+                pass # Not a number, try matching by name
 
-    finally:
-        # Ensure DB connection is closed
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-            # print("DB connection closed.") # Optional debug
+            if book_index == -1: # If not matched by number, try matching by name
+                user_input_lower = user_input.lower()
+                for i, book in enumerate(books):
+                    if user_input_lower in book['product_name'].lower():
+                        book_index = i
+                        break # Take the first match
 
+            if book_index >= 0:
+                # Found a matching book
+                response_text = format_single_book_response(active_order_data, book_index)
+            else:
+                # User input wasn't a book selection or cancellation query for the active order
+                # Use AI to generate a response based on the active order and the new query
+                 response_text = generate_order_summary_ai(active_order_data, user_input, is_hindi)
 
-@app.route('/api/reset', methods=['POST'])
-def reset_session():
-    """Reset the user's session"""
-    session.clear()
-    print("Session cleared by user.")
-    return jsonify({"status": "success", "message": "Session reset successfully"})
+        else:
+            # Active order has 1 or 0 books, and the query isn't cancellation specific or book selection
+            # Use AI to generate a response based on the active order and the new query
+             response_text = generate_order_summary_ai(active_order_data, user_input, is_hindi)
 
+    else:
+        # No order ID found in the current input, and no active order in session
+        # Treat as a general query, using conversation history and FAQ
+        # Prepare messages for the AI model, including system prompt and context
+        messages_for_ai = [{"role": "system", "content": f"""
+        You are a helpful customer service assistant for Bookswagon, an online bookstore.
+        Respond to customer queries about general information or their orders if an order number is provided in the conversation history or current message.
+        
+        Use the following FAQ knowledge to answer general questions:
+        ---
+        {FAQ_KNOWLEDGE}
+        ---
+        
+        If the query is about an order, you must ask for the order number (e.g., "Could you please provide your order number (like UR1234567890) so I can assist you?") unless one is already in the conversation history.
+        Do NOT hallucinate order details if no order number is known.
+        Keep your responses concise.
+        
+        Respond in Hindi or Hinglish ONLY if the user's message contains Hindi words or is in Hinglish. Otherwise, always respond in English only.
+        """}]
+        # Add recent conversation history (limit to prevent context window issues)
+        messages_for_ai.extend(chat_history[-5:]) # Use last 5 messages as context
 
-# --- Function to Create Frontend Files ---
-# (Keep the create_templates_and_static function as previously defined)
-def create_templates_and_static():
-    """Create necessary templates and static files for the application"""
-    templates_dir = 'templates'
-    if not os.path.exists(templates_dir):
-        os.makedirs(templates_dir)
-        print(f"Created directory: {templates_dir}")
+        # Add the current user message to the context for the AI
+        messages_for_ai.append({"role": "user", "content": user_input})
 
-    index_html_content = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bookswagon Customer Support</title>
-    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-    <style>
-        .chat-container {
-            height: calc(100vh - 150px); max-height: 70vh; display: flex; flex-direction: column;
-        }
-        .message-container { flex-grow: 1; overflow-y: auto; padding: 1rem; }
-        .message-wrapper { display: flex; flex-direction: column; margin-bottom: 0.5rem; }
-        .user-message { background-color: #DCF8C6; border-radius: 18px 18px 0 18px; align-self: flex-end; margin-left: auto; }
-        .bot-message { background-color: #f1f0f0; border-radius: 18px 18px 18px 0; align-self: flex-start; margin-right: auto; }
-        .message { max-width: 85%; padding: 10px 15px; word-wrap: break-word; white-space: pre-line; font-size: 0.95rem; line-height: 1.4; }
-        .typing-indicator { display: none; padding: 10px 15px; align-self: flex-start; }
-        .typing-indicator span { height: 8px; width: 8px; background-color: #9ca3af; border-radius: 50%; display: inline-block; margin: 0 2px; animation: bounce 1.4s infinite ease-in-out both; }
-        .typing-indicator span:nth-child(1) { animation-delay: -0.32s; }
-        .typing-indicator span:nth-child(2) { animation-delay: -0.16s; }
-        @keyframes bounce { 0%, 80%, 100% { transform: scale(0); } 40% { transform: scale(1.0); } }
-        .input-area { padding: 1rem; border-top: 1px solid #e5e7eb; }
-        /* Scrollbar styling */
-        .message-container::-webkit-scrollbar { width: 8px; }
-        .message-container::-webkit-scrollbar-track { background: #f1f1f1; }
-        .message-container::-webkit-scrollbar-thumb { background: #ccc; border-radius: 4px; }
-        .message-container::-webkit-scrollbar-thumb:hover { background: #999; }
-    </style>
-</head>
-<body class="bg-gray-100 flex flex-col items-center justify-center min-h-screen p-4">
-    <div class="w-full max-w-2xl bg-white rounded-lg shadow-xl chat-container">
-        <header class="bg-blue-600 text-white p-4 rounded-t-lg flex justify-between items-center">
-            <h1 class="text-xl font-semibold">Bookswagon Support</h1>
-            <button id="resetButton" title="Reset Chat Session" class="bg-red-500 hover:bg-red-600 text-white text-xs font-bold py-1 px-2 rounded">
-                Reset Chat
-            </button>
-        </header>
-        <div id="chatbox" class="message-container">
-            <div class="message-wrapper">
-                <div class="bot-message message">
-                    Hello! How can I help you with your Bookswagon order today?
-                </div>
-            </div>
-        </div>
-        <div id="typing-indicator" class="typing-indicator">
-            <span></span><span></span><span></span>
-        </div>
-        <div class="input-area flex items-center">
-            <input type="text" id="userInput" class="flex-grow border rounded-l-md p-2 focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Type your message...">
-            <button id="sendButton" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-r-md">Send</button>
-        </div>
-    </div>
-    <script>
-        const chatbox = document.getElementById('chatbox');
-        const userInput = document.getElementById('userInput');
-        const sendButton = document.getElementById('sendButton');
-        const resetButton = document.getElementById('resetButton');
-        const typingIndicator = document.getElementById('typing-indicator');
+        response_text = query_deepseek(messages_for_ai)
 
-        function escapeHtml(unsafe) {
-             // Basic escaping, consider a library for production
-             if (typeof unsafe !== 'string') return '';
-             return unsafe
-                  .replace(/&/g, "&amp;")
-                  .replace(/</g, "&lt;")
-                  .replace(/>/g, "&gt;")
-                  .replace(/"/g, "&quot;")
-                  .replace(/'/g, "&#039;");
-        }
-
-        function addMessage(message, sender = 'bot') {
-            const messageWrapper = document.createElement('div');
-            messageWrapper.classList.add('message-wrapper');
-            const messageDiv = document.createElement('div');
-            messageDiv.classList.add('message');
-            messageDiv.classList.add(sender === 'user' ? 'user-message' : 'bot-message');
-            // Use basic escaping instead of textContent to allow line breaks from \n
-            messageDiv.innerHTML = escapeHtml(message).replace(/\n/g, '<br>');
-            messageWrapper.appendChild(messageDiv);
-            chatbox.appendChild(messageWrapper);
-            chatbox.scrollTop = chatbox.scrollHeight;
-        }
-
-        function showTyping(show = true) {
-            typingIndicator.style.display = show ? 'flex' : 'none'; // Use flex for alignment
-            if (show) {
-                chatbox.scrollTop = chatbox.scrollHeight;
-            }
-        }
-
-        async function sendMessage() {
-            const messageText = userInput.value.trim();
-            if (!messageText) return;
-            addMessage(messageText, 'user');
-            userInput.value = '';
-            showTyping(true);
-            userInput.disabled = true; // Disable input while processing
-            sendButton.disabled = true;
-
-            try {
-                const response = await fetch('/api/message', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', },
-                    body: JSON.stringify({ message: messageText }),
-                });
-                showTyping(false);
-                if (!response.ok) {
-                     const errorData = await response.json().catch(() => ({ response: "An unknown error occurred on the server." }));
-                     throw new Error(errorData.response || `HTTP error! status: ${response.status}`);
-                }
-                const data = await response.json();
-                if (data.response) { addMessage(data.response, 'bot'); }
-                if (data.follow_up) {
-                    setTimeout(() => addMessage(data.follow_up, 'bot'), 300);
-                }
-            } catch (error) {
-                showTyping(false);
-                console.error('Error sending message:', error);
-                addMessage(error.message || 'Sorry, I encountered an error. Please try again.', 'bot');
-            } finally {
-                 userInput.disabled = false; // Re-enable input
-                 sendButton.disabled = false;
-                 userInput.focus(); // Set focus back to input
-            }
-        }
-
-        async function resetChat() {
-             const confirmed = confirm("Are you sure you want to reset the chat session?");
-             if (!confirmed) return;
-            try {
-                const response = await fetch('/api/reset', { method: 'POST' });
-                if (response.ok) {
-                    chatbox.innerHTML = '';
-                    addMessage('Session reset. How can I assist you now?', 'bot');
-                    console.log('Session reset successfully');
-                } else { throw new Error('Failed to reset session'); }
-            } catch (error) {
-                console.error('Error resetting session:', error);
-                addMessage('Could not reset the session. Please refresh the page.', 'bot');
-            }
-        }
-
-        sendButton.addEventListener('click', sendMessage);
-        userInput.addEventListener('keypress', (event) => { if (event.key === 'Enter') { sendMessage(); } });
-        resetButton.addEventListener('click', resetChat);
-        userInput.focus(); // Initial focus
-    </script>
-</body>
-</html>
-"""
-    index_file_path = os.path.join(templates_dir, 'index.html')
-    try:
-        with open(index_file_path, 'w', encoding='utf-8') as f:
-            f.write(index_html_content)
-        print(f"Created/Updated file: {index_file_path}")
-    except IOError as e:
-        print(f"Error writing {index_file_path}: {e}")
+        # The general query AI call needs explicit translation if input was Hindi/Hinglish
+        # The generate_order_summary_ai function handles translation internally.
+        if not active_order_data and not extracted_id: # Only translate if it was a general query handled by the main AI prompt
+             response_text = get_response_in_language(response_text, is_hindi)
 
 
-# --- Main Execution ---
+    # If a response was generated directly (not by the AI summary function which handles language)
+    # ensure it is translated if needed. This catches the specific cancellation reason messages etc.
+    if 'generate_order_summary_ai' not in response_text and 'format_order_response' not in response_text and 'format_single_book_response' not in response_text:
+         # This is a bit of a heuristic to check if a specific formatting function was called.
+         # A more robust way might be to have these functions return structured data
+         # and format/translate at the very end. But for this structure, we check.
+         # Simple direct responses need translation.
+         if response_text and not ('**Order Details**' in response_text or '**Details for**' in response_text):
+              response_text = get_response_in_language(response_text, is_hindi)
+
+
+    # Add bot response to history
+    chat_history.append({"role": "assistant", "content": response_text})
+    session['chat_history'] = chat_history
+
+    # Return the response and updated history
+    return jsonify({"response": response_text, "chat_history": chat_history})
+
+# --- Run the Flask App ---
 if __name__ == '__main__':
-    # Ensure API key and DB creds are set (using placeholders here)
-    if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == 'YOUR_DEEPSEEK_API_KEY':
-        print("Warning: DEEPSEEK_API_KEY not set or is a placeholder.")
-    if DB_SERVER_ENV == 'YOUR_SERVER_IP_OR_NAME' or DB_UID_ENV == 'YOUR_DB_USER' or DB_PWD_ENV == 'YOUR_DB_PASSWORD':
-        print("Warning: Database credentials seem to be placeholders.")
-        print("Please set DB_SERVER, DB_USER, DB_PASSWORD environment variables or update script.")
-
-    # Create frontend files if they don't exist
-    create_templates_and_static()
-
-    # Run the Flask app
-    print("Starting Flask server...")
-    # Use debug=False in production for security and performance
-    # host='0.0.0.0' makes it accessible on your local network
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    # Set environment variables if not using a .env file
+    # os.environ['DEEPSEEK_API_KEY'] = 'YOUR_API_KEY'
+    # os.environ['DB_SERVER'] = 'your_server_name'
+    # os.environ['DB_DATABASE'] = 'your_db_name'
+    # os.environ['DB_UID'] = 'your_user_id'
+    # os.environ['DB_PWD'] = 'your_password'
+    
+    # In production, use a production-ready web server like Gunicorn or uWSGI
+    # app.run(debug=True) # debug=True is good for development
+    app.run(host='0.0.0.0', port=5000) # Listen on all interfaces
