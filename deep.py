@@ -281,16 +281,24 @@ def format_single_book_response(order_data, book_index):
 
 def detect_language(text):
     """Detect if text contains Hindi or Hinglish using AI."""
-    prompt = f"""Analyze if the following text contains Hindi words, is written in Hinglish, or uses Devanagari script.
-    Return 'hindi' ONLY if it contains Hindi words, Hinglish phrases (like 'meko', 'batao'), or Devanagari script.
-    Return 'english' for all other cases, including when the text is fully in English.
-    
-    Text: "{text}"
-    
-    Return ONLY 'hindi' or 'english', nothing else."""
-    
-    result = query_deepseek([{"role": "user", "content": prompt}]).strip().lower()
-    return result == "hindi"
+    try:
+        prompt = f"""Analyze if the following text contains Hindi words, is written in Hinglish, or uses Devanagari script.
+        Return 'hindi' ONLY if it contains Hindi words, Hinglish phrases (like 'meko', 'batao'), or Devanagari script.
+        Return 'english' for all other cases, including when the text is fully in English.
+        
+        Text: "{text}"
+        
+        Return ONLY 'hindi' or 'english', nothing else."""
+        
+        result = query_deepseek([{"role": "user", "content": prompt}]).strip().lower()
+        if result not in ["hindi", "english"]:
+            print(f"Warning: Unexpected language detection result: {result}. Defaulting to 'english'.")
+            return False  # Default to English
+        
+        return result == "hindi"
+    except Exception as e:
+        print(f"Error detecting language: {e}. Defaulting to 'english'.")
+        return False  # Default to English
 
 def get_response_in_language(response, is_hindi):
     """Translate or adjust the response based on the detected language."""
@@ -303,6 +311,7 @@ def get_response_in_language(response, is_hindi):
         Provide ONLY the translated text without any explanations or notes."""
         try:
             translated_response = query_deepseek([{"role": "user", "content": translation_prompt}]).strip()
+            print(f"Debug: Translated response: {translated_response}")
             return translated_response
         except Exception as e:
             print(f"Error translating response: {e}")
@@ -403,7 +412,11 @@ def main():
         if not timeout_flag.wait(300):  # Wait for 300 seconds
             farewell_message = "I didn't receive any response. Have a great day! Thank you for using Bookswagon support."
             print(f"\nBookswagon: {farewell_message}")
-            exit(0)
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+            os._exit(0)
 
     try:
         while True:

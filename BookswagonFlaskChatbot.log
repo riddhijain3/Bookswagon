@@ -1,0 +1,10 @@
+2025-04-21 18:20:57,539 - INFO - Bookswagon Flask Chatbot Service service is starting...
+2025-04-21 18:20:57,540 - INFO - .env file loaded.
+2025-04-21 18:20:57,763 - INFO - Starting Waitress server on 0.0.0.0:5000
+2025-04-21 18:20:57,764 - INFO - Bookswagon Flask Chatbot Service service is running.
+2025-04-21 18:20:57,766 - INFO - Serving on http://0.0.0.0:5000
+2025-04-22 10:36:08,397 - INFO - Bookswagon Flask Chatbot Service service is starting...
+2025-04-22 10:36:08,399 - INFO - .env file loaded.
+2025-04-22 10:36:08,773 - INFO - Starting Waitress server on 0.0.0.0:5000
+2025-04-22 10:36:08,775 - INFO - Bookswagon Flask Chatbot Service service is running.
+2025-04-22 10:36:08,779 - INFO - Serving on http://0.0.0.0:5000
